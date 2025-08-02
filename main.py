@@ -61,12 +61,14 @@ def demo_neural_network():
     
     # Create a neural network
     net = NeuralNetwork(input_size=10, num_actions=4)
+    net.eval()  # Set to evaluation mode to avoid batch norm issues
     
     # Create a dummy state
     dummy_state = torch.tensor([0.95, 1.0, 0.9, 0.2, 0.5, 0.2, 1.0, 0.0, 0.0, 0.0], dtype=torch.float32)
     
     # Get predictions
-    policy_probs, value = net(dummy_state)
+    with torch.no_grad():
+        policy_probs, value = net(dummy_state)
     
     print(f"Input state: {dummy_state}")
     print(f"Policy probabilities: {policy_probs}")
@@ -80,6 +82,7 @@ def demo_mcts():
     
     # Create components
     net = NeuralNetwork(input_size=10, num_actions=4)
+    net.eval()  # Set to evaluation mode
     mcts = MCTS(net, num_simulations=50)  # Fewer simulations for demo
     env = BlackjackEnvironment()
     env.reset()
