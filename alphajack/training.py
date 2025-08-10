@@ -156,6 +156,9 @@ class AlphaJackTrainer:
         Returns:
             training_data: Collected training data
         """
+        # Set network to eval mode for self-play to avoid BatchNorm issues
+        self.neural_net.eval()
+        
         training_data = TrainingData()
         env = BlackjackEnvironment()
         
@@ -192,6 +195,9 @@ class AlphaJackTrainer:
         """
         if len(training_data) == 0:
             return
+        
+        # Set network to training mode
+        self.neural_net.train()
         
         # Convert data to tensors
         states = torch.tensor(np.array(training_data.states), dtype=torch.float32)
@@ -366,7 +372,15 @@ class AlphaJackTrainer:
     def load_checkpoint(self, filepath: str):
         """Load training checkpoint"""
         if os.path.exists(filepath):
-            checkpoint = torch.load(filepath)
+            # PyTorch 2.6 defaults to weights_only=True which can break loading
+            # older checkpoints containing optimizer state or numpy scalars.
+            # We explicitly set weights_only=False and map to current device.
+            try:
+                # Load on CPU to be device-agnostic; model/tensors can be moved later if needed
+                checkpoint = torch.load(filepath, map_location="cpu", weights_only=False)
+            except TypeError:
+                # For older torch versions without weights_only arg
+                checkpoint = torch.load(filepath, map_location="cpu")
             self.neural_net.load_state_dict(checkpoint['neural_net_state_dict'])
             self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
             self.training_stats = checkpoint['training_stats']
@@ -388,6 +402,9 @@ class AlphaJackTrainer:
         Returns:
             evaluation_results: Dictionary with evaluation metrics
         """
+        # Set network to eval mode for evaluation
+        self.neural_net.eval()
+        
         env = BlackjackEnvironment()
         total_reward = 0.0
         wins = 0

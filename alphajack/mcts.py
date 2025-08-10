@@ -67,8 +67,16 @@ class MCTSNode:
         
         # Get policy and value from neural network
         with torch.no_grad():
+            # Set network to eval mode for inference to avoid BatchNorm issues
+            was_training = neural_net.training
+            neural_net.eval()
+            
             state_tensor = torch.tensor(self.state, dtype=torch.float32).unsqueeze(0)
             policy_probs, value = neural_net(state_tensor)
+            
+            # Restore original training mode
+            if was_training:
+                neural_net.train()
         
         # Create children for legal actions
         for action in legal_actions:
