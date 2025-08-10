@@ -9,15 +9,17 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import numpy as np
-from typing import List, Tuple
+from typing import List, Tuple, Optional
 import random
 from collections import deque
 import pickle
 import os
+from torch.cuda.amp import GradScaler
 
 from .game_environment import BlackjackEnvironment, Action
 from .neural_network import NeuralNetwork
 from .mcts import MCTS
+from .utils.device import get_device, move_to_device, maybe_autocast, seed_everything, log_device
 
 
 class TrainingData:
@@ -53,15 +55,39 @@ class AlphaJackTrainer:
                  learning_rate: float = 0.001,
                  batch_size: int = 32,
                  buffer_size: int = 10000,
-                 num_simulations: int = 100):
+                 num_simulations: int = 100,
+                 device: str = "auto",
+                 amp: int = 1,
+                 seed: int = 42,
+                 deterministic: bool = False,
+                 max_grad_norm: float = 1.0,
+                 compile: bool = False):
+        
+        # Set up device and seeding
+        seed_everything(seed, deterministic=deterministic)
+        self.device, self.amp_dtype = get_device(device)
+        log_device()
         
         self.state_size = state_size
         self.num_actions = num_actions
         self.batch_size = batch_size
         self.num_simulations = num_simulations
+        self.max_grad_norm = max_grad_norm
         
         # Initialize neural network
         self.neural_net = NeuralNetwork(state_size, num_actions)
+        
+        # Try to compile model (PyTorch 2.x)
+        if compile:
+            try:
+                self.neural_net = torch.compile(self.neural_net, backend="inductor")
+                print("Model compiled successfully")
+            except Exception as e:
+                print(f"torch.compile skipped: {e}")
+        
+        # Move model to device
+        self.neural_net = self.neural_net.to(self.device)
+        
         self.optimizer = optim.Adam(self.neural_net.parameters(), lr=learning_rate)
         
         # Initialize MCTS
@@ -69,6 +95,15 @@ class AlphaJackTrainer:
         
         # Training data buffer
         self.training_buffer = deque(maxlen=buffer_size)
+        
+        # Setup gradient scaler for AMP
+        try:
+            # Try new API first (PyTorch 2.0+)
+            from torch.amp import GradScaler as NewGradScaler
+            self.scaler = NewGradScaler('cuda', enabled=(self.device.type == "cuda" and bool(amp)))
+        except (ImportError, TypeError):
+            # Fall back to old API
+            self.scaler = GradScaler(enabled=(self.device.type == "cuda" and bool(amp)))
         
         # Training statistics
         self.training_stats = {
@@ -184,7 +219,7 @@ class AlphaJackTrainer:
     
     def train_network(self, training_data: TrainingData, epochs: int = 10):
         """
-        Train the neural network on collected data
+        Train the neural network on collected data with GPU and AMP support
         
         Args:
             training_data: Training data from self-play
@@ -200,7 +235,21 @@ class AlphaJackTrainer:
         
         # Create dataset
         dataset = torch.utils.data.TensorDataset(states, action_probs, outcomes)
-        dataloader = torch.utils.data.DataLoader(dataset, batch_size=self.batch_size, shuffle=True)
+        
+        # Make DataLoader CUDA-friendly with optimized settings
+        is_cuda = torch.cuda.is_available()
+        num_workers = 2  # Use 2 workers for better performance
+        dataloader = torch.utils.data.DataLoader(
+            dataset, 
+            batch_size=self.batch_size, 
+            shuffle=True,
+            num_workers=num_workers,
+            pin_memory=is_cuda,
+            persistent_workers=(num_workers > 0)
+        )
+        
+        # Set model to training mode
+        self.neural_net.train()
         
         # Training loop
         epoch_entropies = []
@@ -212,22 +261,48 @@ class AlphaJackTrainer:
             num_batches = 0
             
             for batch_states, batch_action_probs, batch_outcomes in dataloader:
-                self.optimizer.zero_grad()
+                # Move batch to device
+                batch = move_to_device((batch_states, batch_action_probs, batch_outcomes), 
+                                       self.device, non_blocking=True)
+                batch_states, batch_action_probs, batch_outcomes = batch
                 
-                # Forward pass
-                predicted_probs, predicted_values = self.neural_net(batch_states)
+                # Ensure correct dtype for targets
+                batch_outcomes = batch_outcomes.float()
                 
-                # Calculate losses
-                policy_loss = self._calculate_policy_loss(predicted_probs, batch_action_probs)
-                value_loss = self._calculate_value_loss(predicted_values, batch_outcomes)
-                total_loss = policy_loss + value_loss
+                self.optimizer.zero_grad(set_to_none=True)
                 
-                # Calculate policy entropy
-                batch_entropy = self._calculate_policy_entropy(predicted_probs)
+                # Forward pass with mixed precision
+                with maybe_autocast(self.device, self.amp_dtype):
+                    predicted_probs, predicted_values = self.neural_net(batch_states)
+                    
+                    # Calculate losses
+                    policy_loss = self._calculate_policy_loss(predicted_probs, batch_action_probs)
+                    value_loss = self._calculate_value_loss(predicted_values, batch_outcomes)
+                    total_loss = policy_loss + value_loss
                 
-                # Backward pass
-                total_loss.backward()
-                self.optimizer.step()
+                # Backward pass with gradient scaling
+                if self.scaler.is_enabled():
+                    self.scaler.scale(total_loss).backward()
+                    self.scaler.unscale_(self.optimizer)
+                    
+                    # Gradient clipping
+                    if self.max_grad_norm and self.max_grad_norm > 0:
+                        torch.nn.utils.clip_grad_norm_(self.neural_net.parameters(), self.max_grad_norm)
+                    
+                    self.scaler.step(self.optimizer)
+                    self.scaler.update()
+                else:
+                    total_loss.backward()
+                    
+                    # Gradient clipping
+                    if self.max_grad_norm and self.max_grad_norm > 0:
+                        torch.nn.utils.clip_grad_norm_(self.neural_net.parameters(), self.max_grad_norm)
+                    
+                    self.optimizer.step()
+                
+                # Calculate policy entropy (outside autocast for accuracy)
+                with torch.no_grad():
+                    batch_entropy = self._calculate_policy_entropy(predicted_probs)
                 
                 # Update statistics
                 epoch_policy_loss += policy_loss.item()
@@ -380,14 +455,18 @@ class AlphaJackTrainer:
     
     def evaluate(self, num_games: int = 100, verbose: bool = True) -> dict:
         """
-        Evaluate the current policy
+        Evaluate the current policy with GPU support and proper train/eval mode switching
         
         Args:
             num_games: Number of games to play for evaluation
+            verbose: Whether to print verbose output
             
         Returns:
             evaluation_results: Dictionary with evaluation metrics
         """
+        # Set model to evaluation mode
+        self.neural_net.eval()
+        
         env = BlackjackEnvironment()
         total_reward = 0.0
         wins = 0
@@ -397,38 +476,39 @@ class AlphaJackTrainer:
         if verbose:
             print(f"Evaluating policy on {num_games} games...")
         
-        for game_idx in range(num_games):
-            env.reset()
-            
-            while not env.game_over:
-                legal_actions = env.get_legal_actions()
-                if not legal_actions:
-                    break
+        with torch.no_grad():  # Disable gradient computation for evaluation
+            for game_idx in range(num_games):
+                env.reset()
                 
-                # Use deterministic policy (temperature = 0)
-                action_probs = self.mcts.get_action_probabilities(env, temperature=0.0)
+                while not env.game_over:
+                    legal_actions = env.get_legal_actions()
+                    if not legal_actions:
+                        break
+                    
+                    # Use deterministic policy (temperature = 0)
+                    action_probs = self.mcts.get_action_probabilities(env, temperature=0.0)
+                    
+                    # Select best action
+                    best_action_idx = np.argmax([
+                        action_probs[action.value] for action in legal_actions
+                    ])
+                    selected_action = legal_actions[best_action_idx]
+                    
+                    # Take action
+                    _, _, done = env.step(selected_action)
+                    if done:
+                        break
                 
-                # Select best action
-                best_action_idx = np.argmax([
-                    action_probs[action.value] for action in legal_actions
-                ])
-                selected_action = legal_actions[best_action_idx]
+                # Get final reward
+                reward = env._calculate_final_reward()
+                total_reward += reward
                 
-                # Take action
-                _, _, done = env.step(selected_action)
-                if done:
-                    break
-            
-            # Get final reward
-            reward = env._calculate_final_reward()
-            total_reward += reward
-            
-            if reward > 0:
-                wins += 1
-            elif reward < 0:
-                losses += 1
-            else:
-                pushes += 1
+                if reward > 0:
+                    wins += 1
+                elif reward < 0:
+                    losses += 1
+                else:
+                    pushes += 1
         
         avg_reward = total_reward / num_games
         win_rate = wins / num_games

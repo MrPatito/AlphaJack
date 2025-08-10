@@ -66,9 +66,20 @@ class MCTSNode:
             return 0.0
         
         # Get policy and value from neural network
+        # Set model to eval mode temporarily for single sample inference
+        was_training = neural_net.training
+        neural_net.eval()
+        
         with torch.no_grad():
             state_tensor = torch.tensor(self.state, dtype=torch.float32).unsqueeze(0)
+            # Move tensor to same device as model
+            device = next(neural_net.parameters()).device
+            state_tensor = state_tensor.to(device)
             policy_probs, value = neural_net(state_tensor)
+        
+        # Restore original training mode
+        if was_training:
+            neural_net.train()
         
         # Create children for legal actions
         for action in legal_actions:

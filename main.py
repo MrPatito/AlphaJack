@@ -101,13 +101,33 @@ def train_alphajack(args):
     """Train the AlphaJack AI"""
     print("=== Training AlphaJack ===")
     
-    # Create trainer
+    # Apply smoke test settings if enabled
+    if args.smoke:
+        print("🚀 SMOKE TEST MODE: Reducing parameters for quick validation")
+        args.iterations = min(args.iterations, 2)
+        args.games_per_iteration = min(args.games_per_iteration, 10)
+        args.epochs_per_iteration = min(args.epochs_per_iteration, 2)
+        args.simulations = min(args.simulations, 25)
+        args.eval_games = min(args.eval_games, 50)
+        print(f"   → Iterations: {args.iterations}")
+        print(f"   → Games per iteration: {args.games_per_iteration}")
+        print(f"   → Epochs per iteration: {args.epochs_per_iteration}")
+        print(f"   → MCTS simulations: {args.simulations}")
+        print(f"   → Evaluation games: {args.eval_games}")
+    
+    # Create trainer with GPU/AMP support
     trainer = AlphaJackTrainer(
         state_size=10,  # Updated for enhanced state representation
         num_actions=4,
         learning_rate=args.learning_rate,
         batch_size=args.batch_size,
-        num_simulations=args.simulations
+        num_simulations=args.simulations,
+        device=args.device,
+        amp=args.amp,
+        seed=args.seed,
+        deterministic=args.deterministic,
+        max_grad_norm=args.max_grad_norm,
+        compile=args.compile
     )
     
     # Load checkpoint if specified
@@ -138,6 +158,14 @@ def evaluate_model(args):
         print("Error: Please specify --model_path for evaluation")
         return
     
+    # Apply smoke test settings if enabled
+    if args.smoke:
+        print("🚀 SMOKE TEST MODE: Reducing evaluation games")
+        args.eval_games = min(args.eval_games, 50)
+        args.simulations = min(args.simulations, 25)
+        print(f"   → Evaluation games: {args.eval_games}")
+        print(f"   → MCTS simulations: {args.simulations}")
+    
     # Create trainer and load model
     trainer = AlphaJackTrainer(num_simulations=args.simulations)
     trainer.load_checkpoint(args.model_path)
@@ -156,6 +184,12 @@ def evaluate_model(args):
 def play_interactive_game(args):
     """Play an interactive game against the AI"""
     print("=== Interactive Game ===")
+    
+    # Apply smoke test settings if enabled
+    if args.smoke:
+        print("🚀 SMOKE TEST MODE: Reducing MCTS simulations")
+        args.simulations = min(args.simulations, 25)
+        print(f"   → MCTS simulations: {args.simulations}")
     
     if not args.model_path:
         print("Playing against random AI (no trained model specified)")
@@ -327,6 +361,22 @@ def main():
     parser.add_argument("--eval_games", type=int, 
                        default=config.getint('evaluate', 'eval_games', fallback=1000),
                        help="Number of games for evaluation")
+    
+    # GPU/AMP arguments
+    parser.add_argument("--device", type=str, default="auto", choices=["auto", "cuda", "cpu"], 
+                       help="Compute device preference")
+    parser.add_argument("--amp", type=int, default=1, 
+                       help="Enable mixed precision (1) or disable (0)")
+    parser.add_argument("--seed", type=int, default=42, 
+                       help="Random seed")
+    parser.add_argument("--deterministic", action="store_true", 
+                       help="Enable deterministic ops (slower)")
+    parser.add_argument("--max_grad_norm", type=float, default=1.0, 
+                       help="Gradient clipping max norm")
+    parser.add_argument("--compile", action="store_true", 
+                       help="Compile model with torch.compile (PyTorch 2.x)")
+    parser.add_argument("--smoke", action="store_true",
+                       help="Run a fast smoke test (tiny data, few steps)")
     
     args = parser.parse_args()
     
